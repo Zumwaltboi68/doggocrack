@@ -1,3 +1,4 @@
+// optimized_cpp_cracker.cpp
 #include <string>
 #include <vector>
 #include <cstring>
@@ -7,7 +8,12 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
-#include <immintrin.h>
+#include <cstdint>
+#include <cstdlib>
+
+#if defined(__AVX2__) && !defined(__EMSCRIPTEN__)
+  #include <immintrin.h>
+#endif
 
 // WebAssembly and threading support
 #ifdef __EMSCRIPTEN__
@@ -18,7 +24,33 @@
 #define EXPORT
 #endif
 
-// SIMD-optimized constants for parallel processing
+// -------------------- Portability helpers --------------------
+
+// define __forceinline for non-MSVC compilers
+#ifndef __forceinline
+  #if defined(_MSC_VER)
+    /* MSVC already */
+  #else
+    #define __forceinline inline __attribute__((always_inline))
+  #endif
+#endif
+
+// Portable rotate helpers (works on all compilers)
+static __forceinline uint32_t rotl32(uint32_t x, unsigned n) {
+    return (x << n) | (x >> (32 - n));
+}
+static __forceinline uint32_t rotr32(uint32_t x, unsigned n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+// Detect AVX2 availability for native builds (WASM doesn't have AVX2)
+#if defined(__AVX2__) && !defined(__EMSCRIPTEN__)
+  #define HAVE_AVX2 1
+#else
+  #define HAVE_AVX2 0
+#endif
+
+// -------------------- SHA-256 constants --------------------
 alignas(32) static const uint32_t SHA256_K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -35,7 +67,7 @@ alignas(32) static const uint32_t SHA256_H[8] = {
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-// Ultra-fast SHA-256 implementation with SIMD optimizations
+// -------------------- UltraFastSHA256 --------------------
 class UltraFastSHA256 {
 private:
     alignas(32) uint32_t state[8];
@@ -43,16 +75,12 @@ private:
     uint64_t bitlen;
     uint32_t datalen;
 
-    // Inline assembly optimized rotate right
+    // portable rotate-right wrapper
     __forceinline uint32_t rotr(uint32_t x, uint32_t n) const {
-#ifdef __x86_64__
-        return _rotr(x, n);
-#else
-        return (x >> n) | (x << (32 - n));
-#endif
+        return rotr32(x, (unsigned)n);
     }
 
-    // SIMD-optimized SHA-256 round functions
+    // SHA helper functions
     __forceinline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) const {
         return (x & y) ^ (~x & z);
     }
@@ -81,16 +109,18 @@ private:
         alignas(32) uint32_t w[64];
         uint32_t a, b, c, d, e, f, g, h, t1, t2;
 
-        // Prepare message schedule with loop unrolling
+        // Prepare message schedule
         for (int i = 0; i < 16; i++) {
-            w[i] = __builtin_bswap32(((uint32_t*)buffer)[i]);
+            uint32_t word;
+            std::memcpy(&word, buffer + i * 4, 4);
+            w[i] = __builtin_bswap32(word);
         }
 
-        // Unrolled message schedule extension
+        // Message schedule extension (unrolled in steps of 4 for speed)
         for (int i = 16; i < 64; i += 4) {
-            w[i] = sig1(w[i-2]) + w[i-7] + sig0(w[i-15]) + w[i-16];
+            w[i]   = sig1(w[i-2]) + w[i-7] + sig0(w[i-15]) + w[i-16];
             w[i+1] = sig1(w[i-1]) + w[i-6] + sig0(w[i-14]) + w[i-15];
-            w[i+2] = sig1(w[i]) + w[i-5] + sig0(w[i-13]) + w[i-14];
+            w[i+2] = sig1(w[i])   + w[i-5] + sig0(w[i-13]) + w[i-14];
             w[i+3] = sig1(w[i+1]) + w[i-4] + sig0(w[i-12]) + w[i-13];
         }
 
@@ -98,44 +128,36 @@ private:
         a = state[0]; b = state[1]; c = state[2]; d = state[3];
         e = state[4]; f = state[5]; g = state[6]; h = state[7];
 
-        // Main compression loop - fully unrolled for maximum speed
+        // Compression loop (fully unrolled in groups of 8)
         for (int i = 0; i < 64; i += 8) {
-            // Round i
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i] + w[i];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+1
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+1] + w[i+1];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+2
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+2] + w[i+2];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+3
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+3] + w[i+3];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+4
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+4] + w[i+4];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+5
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+5] + w[i+5];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+6
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+6] + w[i+6];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
 
-            // Round i+7
             t1 = h + ep1(e) + ch(e, f, g) + SHA256_K[i+7] + w[i+7];
             t2 = ep0(a) + maj(a, b, c);
             h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
@@ -147,20 +169,18 @@ private:
     }
 
 public:
-    UltraFastSHA256() {
-        init();
-    }
+    UltraFastSHA256() { init(); }
 
     void init() {
         datalen = 0;
         bitlen = 0;
-        memcpy(state, SHA256_H, sizeof(SHA256_H));
+        std::memcpy(state, SHA256_H, sizeof(SHA256_H));
+        std::memset(buffer, 0, sizeof(buffer));
     }
 
     void update(const uint8_t data[], size_t len) {
         for (size_t i = 0; i < len; ++i) {
-            buffer[datalen] = data[i];
-            datalen++;
+            buffer[datalen++] = data[i];
             if (datalen == 64) {
                 transform();
                 bitlen += 512;
@@ -180,26 +200,26 @@ public:
             buffer[i++] = 0x80;
             while (i < 64) buffer[i++] = 0x00;
             transform();
-            memset(buffer, 0, 56);
+            std::memset(buffer, 0, 56);
         }
 
         // Append length
         bitlen += datalen * 8;
-        buffer[63] = bitlen;
-        buffer[62] = bitlen >> 8;
-        buffer[61] = bitlen >> 16;
-        buffer[60] = bitlen >> 24;
-        buffer[59] = bitlen >> 32;
-        buffer[58] = bitlen >> 40;
-        buffer[57] = bitlen >> 48;
-        buffer[56] = bitlen >> 56;
+        buffer[63] = static_cast<uint8_t>(bitlen);
+        buffer[62] = static_cast<uint8_t>(bitlen >> 8);
+        buffer[61] = static_cast<uint8_t>(bitlen >> 16);
+        buffer[60] = static_cast<uint8_t>(bitlen >> 24);
+        buffer[59] = static_cast<uint8_t>(bitlen >> 32);
+        buffer[58] = static_cast<uint8_t>(bitlen >> 40);
+        buffer[57] = static_cast<uint8_t>(bitlen >> 48);
+        buffer[56] = static_cast<uint8_t>(bitlen >> 56);
         transform();
 
         // Convert to bytes
         for (i = 0; i < 4; ++i) {
-            hash[i] = (state[0] >> (24 - i * 8)) & 0x000000ff;
-            hash[i + 4] = (state[1] >> (24 - i * 8)) & 0x000000ff;
-            hash[i + 8] = (state[2] >> (24 - i * 8)) & 0x000000ff;
+            hash[i]      = (state[0] >> (24 - i * 8)) & 0x000000ff;
+            hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0x000000ff;
+            hash[i + 8]  = (state[2] >> (24 - i * 8)) & 0x000000ff;
             hash[i + 12] = (state[3] >> (24 - i * 8)) & 0x000000ff;
             hash[i + 16] = (state[4] >> (24 - i * 8)) & 0x000000ff;
             hash[i + 20] = (state[5] >> (24 - i * 8)) & 0x000000ff;
@@ -211,48 +231,45 @@ public:
     // Optimized single-shot hash for short strings
     __forceinline void hashShortString(const char* str, size_t len, uint8_t hash[32]) {
         init();
-        update((const uint8_t*)str, len);
+        update(reinterpret_cast<const uint8_t*>(str), len);
         final(hash);
     }
 };
 
-// Ultra-fast MD5 implementation
+// -------------------- UltraFastMD5 --------------------
 class UltraFastMD5 {
 private:
     static const uint32_t S[64];
     static const uint32_t K[64];
-    
+
     __forceinline uint32_t F(uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (~x & z); }
     __forceinline uint32_t G(uint32_t x, uint32_t y, uint32_t z) { return (x & z) | (y & ~z); }
     __forceinline uint32_t H(uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; }
     __forceinline uint32_t I(uint32_t x, uint32_t y, uint32_t z) { return y ^ (x | ~z); }
-    
-    __forceinline uint32_t rotl(uint32_t x, uint32_t n) {
-#ifdef __x86_64__
-        return _rotl(x, n);
-#else
-        return (x << n) | (x >> (32 - n));
-#endif
-    }
 
 public:
+    __forceinline uint32_t rotl(uint32_t x, uint32_t n) {
+        return rotl32(x, (unsigned)n);
+    }
+
     void hashShortString(const char* str, size_t len, uint8_t hash[16]) {
         uint32_t h[4] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476};
-        
+
         // For very short strings, use optimized path
-        alignas(16) uint8_t padded[64] = {0};
-        memcpy(padded, str, len);
+        alignas(16) uint8_t padded[64];
+        std::memset(padded, 0, 64);
+        std::memcpy(padded, str, len);
         padded[len] = 0x80;
-        
-        // Append length
-        uint64_t bitLen = len * 8;
-        memcpy(padded + 56, &bitLen, 8);
-        
+
+        // Append length (little-endian for MD5)
+        uint64_t bitLen = static_cast<uint64_t>(len) * 8ULL;
+        std::memcpy(padded + 56, &bitLen, 8);
+
         // Process block
-        uint32_t* w = (uint32_t*)padded;
+        uint32_t* w = reinterpret_cast<uint32_t*>(padded);
         uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
-        
-        // Unrolled MD5 rounds for maximum speed
+
+        // Unrolled MD5 rounds (four phases)
         for (int i = 0; i < 16; i += 4) {
             uint32_t temp;
             temp = a + F(b, c, d) + w[i] + K[i]; a = d; d = c; c = b; b += rotl(temp, S[i]);
@@ -260,7 +277,7 @@ public:
             temp = a + F(b, c, d) + w[i+2] + K[i+2]; a = d; d = c; c = b; b += rotl(temp, S[i+2]);
             temp = a + F(b, c, d) + w[i+3] + K[i+3]; a = d; d = c; c = b; b += rotl(temp, S[i+3]);
         }
-        
+
         for (int i = 16; i < 32; i += 4) {
             uint32_t temp;
             int g = (5*i + 1) % 16;
@@ -272,7 +289,7 @@ public:
             g = (5*(i+3) + 1) % 16;
             temp = a + G(b, c, d) + w[g] + K[i+3]; a = d; d = c; c = b; b += rotl(temp, S[i+3]);
         }
-        
+
         for (int i = 32; i < 48; i += 4) {
             uint32_t temp;
             int g = (3*i + 5) % 16;
@@ -284,7 +301,7 @@ public:
             g = (3*(i+3) + 5) % 16;
             temp = a + H(b, c, d) + w[g] + K[i+3]; a = d; d = c; c = b; b += rotl(temp, S[i+3]);
         }
-        
+
         for (int i = 48; i < 64; i += 4) {
             uint32_t temp;
             int g = (7*i) % 16;
@@ -296,13 +313,32 @@ public:
             g = (7*(i+3)) % 16;
             temp = a + I(b, c, d) + w[g] + K[i+3]; a = d; d = c; c = b; b += rotl(temp, S[i+3]);
         }
-        
+
         h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-        memcpy(hash, h, 16);
+        std::memcpy(hash, h, 16);
     }
 };
 
-// High-performance parallel hash cracker
+// MD5 constants
+const uint32_t UltraFastMD5::S[64] = {
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+};
+
+const uint32_t UltraFastMD5::K[64] = {
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+};
+
+// -------------------- High-performance parallel hash cracker --------------------
 class HyperSpeedCracker {
 private:
     std::atomic<bool> running;
@@ -313,72 +349,78 @@ private:
     std::string charset;
     int maxLength;
     int numThreads;
-    
+
     UltraFastSHA256 sha256Engine;
     UltraFastMD5 md5Engine;
-    
+
 public:
     HyperSpeedCracker() : running(false), found(false), totalHashes(0) {
-        numThreads = std::max(1u, std::thread::hardware_concurrency());
+        unsigned conc = std::thread::hardware_concurrency();
+        numThreads = static_cast<int>(conc ? conc : 1u);
     }
-    
+
     // Optimized candidate generation using bit manipulation
-    __forceinline void indexToCandidate(uint64_t index, int length, const char* charset, int charsetSize, char* output) {
+    __forceinline void indexToCandidate(uint64_t index, int length, const char* charsetArr, int charsetSize, char* output) {
         for (int i = length - 1; i >= 0; i--) {
-            output[i] = charset[index % charsetSize];
+            output[i] = charsetArr[index % charsetSize];
             index /= charsetSize;
         }
         output[length] = '\0';
     }
-    
-    // SIMD-optimized hash comparison
+
+    // SIMD-optimized hash comparison (guarded)
     __forceinline bool compareHashes(const uint8_t* hash1, const uint8_t* hash2, int len) {
-#ifdef __AVX2__
+#if HAVE_AVX2
         if (len == 32) { // SHA-256
-            __m256i v1 = _mm256_loadu_si256((__m256i*)hash1);
-            __m256i v2 = _mm256_loadu_si256((__m256i*)hash2);
+            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hash1));
+            __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hash2));
             __m256i cmp = _mm256_cmpeq_epi8(v1, v2);
             return _mm256_movemask_epi8(cmp) == 0xFFFFFFFF;
         }
 #endif
-        return memcmp(hash1, hash2, len) == 0;
+        return std::memcmp(hash1, hash2, len) == 0;
     }
-    
+
     // Hex string to bytes conversion
     void hexToBytes(const std::string& hex, uint8_t* bytes) {
-        for (size_t i = 0; i < hex.length(); i += 2) {
-            bytes[i/2] = std::stoi(hex.substr(i, 2), nullptr, 16);
+        size_t len = hex.length();
+        for (size_t i = 0; i < len && i + 1 < len; i += 2) {
+            bytes[i/2] = static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16));
         }
     }
-    
+
     // Multi-threaded brute force worker
-    void bruteForceWorker(int threadId, int algorithm, const std::string& target, 
-                         const std::string& charset, int length, uint64_t start, uint64_t end) {
-        
+    void bruteForceWorker(int threadId, int algorithm, const std::string& target,
+                         const std::string& charsetStr, int length, uint64_t start, uint64_t end) {
+
         alignas(32) uint8_t candidateHash[32];
         alignas(32) uint8_t targetBytes[32];
-        char candidate[32];
-        
+        char candidate[64];
+
         int hashLen = (algorithm == 0) ? 32 : 16; // SHA-256 : MD5
+        std::memset(targetBytes, 0, 32);
         hexToBytes(target, targetBytes);
-        
-        const int batchSize = 100000; // Process in batches for better performance
+
+        const int batchSize = 100000;
         uint64_t localHashes = 0;
-        
+
+        const char* charsetArr = charsetStr.c_str();
+        int charsetSize = static_cast<int>(charsetStr.length());
+
         for (uint64_t i = start; i < end && running.load() && !found.load(); i += batchSize) {
             uint64_t batchEnd = std::min(i + batchSize, end);
-            
+
             for (uint64_t j = i; j < batchEnd && running.load() && !found.load(); j++) {
-                indexToCandidate(j, length, charset.c_str(), charset.length(), candidate);
-                
+                indexToCandidate(j, length, charsetArr, charsetSize, candidate);
+
                 if (algorithm == 0) {
                     sha256Engine.hashShortString(candidate, length, candidateHash);
                 } else {
                     md5Engine.hashShortString(candidate, length, candidateHash);
                 }
-                
+
                 localHashes++;
-                
+
                 if (compareHashes(candidateHash, targetBytes, hashLen)) {
                     bool expected = false;
                     if (found.compare_exchange_strong(expected, true)) {
@@ -388,69 +430,71 @@ public:
                     }
                 }
             }
-            
-            // Update global counter periodically
+
             totalHashes.fetch_add(localHashes);
             localHashes = 0;
         }
-        
+
         totalHashes.fetch_add(localHashes);
     }
-    
+
     std::string crack(const std::string& hash, const std::string& charset, int maxLen, int algorithm = 0) {
         if (running.load()) return "Already running";
-        
+
         running.store(true);
         found.store(false);
         totalHashes.store(0);
         foundPassword.clear();
-        
+
         auto startTime = std::chrono::high_resolution_clock::now();
-        
+
         for (int length = 1; length <= maxLen && running.load() && !found.load(); length++) {
             uint64_t totalCombinations = 1;
             for (int i = 0; i < length; i++) {
-                totalCombinations *= charset.length();
+                totalCombinations *= static_cast<uint64_t>(charset.length());
+                if (totalCombinations == 0) break;
             }
-            
-            uint64_t combinationsPerThread = totalCombinations / numThreads;
+
+            if (totalCombinations == 0) break;
+
+            uint64_t combinationsPerThread = totalCombinations / static_cast<uint64_t>(numThreads);
             std::vector<std::thread> workers;
-            
+
             for (int t = 0; t < numThreads; t++) {
-                uint64_t start = t * combinationsPerThread;
-                uint64_t end = (t == numThreads - 1) ? totalCombinations : (t + 1) * combinationsPerThread;
-                
-                workers.emplace_back(&HyperSpeedCracker::bruteForceWorker, this, 
-                                   t, algorithm, hash, charset, length, start, end);
+                uint64_t start = static_cast<uint64_t>(t) * combinationsPerThread;
+                uint64_t end = (t == numThreads - 1) ? totalCombinations : (static_cast<uint64_t>(t + 1) * combinationsPerThread);
+
+                workers.emplace_back(&HyperSpeedCracker::bruteForceWorker, this,
+                                      t, algorithm, hash, charset, length, start, end);
             }
-            
+
             for (auto& worker : workers) {
                 worker.join();
             }
-            
+
             if (found.load()) break;
         }
-        
+
         running.store(false);
-        
+
         auto endTime = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        
+        (void)std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime); // unused currently
+
         if (found.load()) {
             return foundPassword;
         }
-        
+
         return "";
     }
-    
+
     uint64_t getHashRate() const {
         return totalHashes.load();
     }
-    
+
     void stop() {
         running.store(false);
     }
-    
+
     bool isRunning() const {
         return running.load();
     }
@@ -459,7 +503,7 @@ public:
 // Global cracker instance
 static HyperSpeedCracker cracker;
 
-// WebAssembly exports
+// WebAssembly / C exports
 EXPORT const char* ultraCrack(const char* hash, const char* charset, int maxLength, int algorithm) {
     static std::string result;
     result = cracker.crack(std::string(hash), std::string(charset), maxLength, algorithm);
@@ -482,14 +526,15 @@ EXPORT const char* hashSHA256(const char* input) {
     static std::string result;
     UltraFastSHA256 hasher;
     alignas(32) uint8_t hash[32];
-    
-    hasher.hashShortString(input, strlen(input), hash);
-    
+
+    hasher.hashShortString(input, std::strlen(input), hash);
+
     std::stringstream ss;
+    ss << std::hex << std::setfill('0');
     for (int i = 0; i < 32; i++) {
-        ss << std::hex << std::setfill('0') << std::setw(2) << (int)hash[i];
+        ss << std::setw(2) << static_cast<int>(hash[i]);
     }
-    
+
     result = ss.str();
     return result.c_str();
 }
@@ -498,33 +543,15 @@ EXPORT const char* hashMD5(const char* input) {
     static std::string result;
     UltraFastMD5 hasher;
     alignas(16) uint8_t hash[16];
-    
-    hasher.hashShortString(input, strlen(input), hash);
-    
+
+    hasher.hashShortString(input, std::strlen(input), hash);
+
     std::stringstream ss;
+    ss << std::hex << std::setfill('0');
     for (int i = 0; i < 16; i++) {
-        ss << std::hex << std::setfill('0') << std::setw(2) << (int)hash[i];
+        ss << std::setw(2) << static_cast<int>(hash[i]);
     }
-    
+
     result = ss.str();
     return result.c_str();
 }
-
-// MD5 constants
-const uint32_t UltraFastMD5::S[64] = {
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
-};
-
-const uint32_t UltraFastMD5::K[64] = {
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
-};
